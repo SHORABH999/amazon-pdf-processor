@@ -1,0 +1,295 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Amazon Label Annotator (SKU+Qty) — Offline</title>
+  <style>
+    body{font-family:Inter,system-ui,Segoe UI,Roboto,Arial;margin:18px;background:#f7fafc;color:#0f172a}
+    .box{max-width:980px;margin:0 auto;background:white;padding:18px;border-radius:10px;box-shadow:0 6px 24px rgba(2,6,23,0.06)}
+    h1{font-size:20px;margin:0 0 12px}
+    .row{display:flex;gap:12px;align-items:center;margin-bottom:12px}
+    input[type=file]{padding:6px}
+    button{background:#0ea5e9;border:none;color:white;padding:10px 14px;border-radius:8px;cursor:pointer}
+    button.secondary{background:#6b7280}
+    .small{font-size:13px;color:#374151}
+    .status{margin-top:10px;padding:10px;background:#eef2ff;border-radius:8px;color:#0f172a}
+    .results{margin-top:14px}
+    .line{padding:8px;border-bottom:1px solid #eef2ff}
+    a.download{display:inline-block;margin-top:8px}
+    pre{white-space:pre-wrap;background:#0b1220;color:#c7f9e3;padding:12px;border-radius:8px;overflow:auto}
+  </style>
+</head>
+<body>
+  <div class="box">
+    <h1>Amazon Label Annotator — SKU & Qty onto Labels</h1>
+    <div class="small">Upload 1 or more multi-page PDFs (invoice + label pairs). Tool extracts SKU & Qty from invoice pages, pastes them onto the following label page, removes invoices, and returns a merged PDF with annotated labels only.</div>
+
+    <div class="row" style="margin-top:12px">
+      <input id="files" type="file" accept="application/pdf" multiple />
+      <button id="processBtn">Process</button>
+      <button id="downloadAll" class="secondary" style="display:none">Download processed PDF</button>
+      <button id="resetBtn" class="secondary">Reset</button>
+    </div>
+
+    <div id="status" class="status">Status: idle</div>
+    <div id="results" class="results"></div>
+    <div class="small" style="margin-top:10px;color:#6b7280">If nothing happens after pressing Process, run the file from a local server: <code>python -m http.server 8000</code> and open <code>http://localhost:8000/amazon_label_tool.html</code>.</div>
+  </div>
+
+  <!-- pdf.js and pdf-lib -->
+  <script src="https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.338/build/pdf.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/pdf-lib@1.17.1/dist/pdf-lib.min.js"></script>
+
+  <script>
+    // Worker config for pdf.js
+    pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.338/build/pdf.worker.min.js';
+
+    const filesInput = document.getElementById('files');
+    const processBtn = document.getElementById('processBtn');
+    const resetBtn = document.getElementById('resetBtn');
+    const statusEl = document.getElementById('status');
+    const resultsEl = document.getElementById('results');
+    const downloadAllBtn = document.getElementById('downloadAll');
+
+    function setStatus(msg, isError=false){
+      statusEl.textContent = 'Status: ' + msg;
+      statusEl.style.background = isError ? '#fee2e2' : '#eef2ff';
+      if(isError) statusEl.style.color = '#991b1b'; else statusEl.style.color = '#0f172a';
+      console.log('STATUS:', msg);
+    }
+
+    function log(msg){ const p = document.createElement('div'); p.className='line'; p.textContent = msg; resultsEl.appendChild(p); console.log(msg); }
+
+    // Extract text from a page using pdf.js and return as string
+    async function extractPageText(pdfDoc, pageIndex){
+      try{
+        const page = await pdfDoc.getPage(pageIndex + 1);
+        const tc = await page.getTextContent();
+        // sort roughly by transform (y desc)
+        const items = tc.items.map(i => ({str:i.str, y: i.transform ? -i.transform[5] : 0, x: i.transform ? i.transform[4] : 0}));
+        items.sort((a,b)=> Math.abs(b.y - a.y) > 2 ? b.y - a.y : a.x - b.x);
+        return items.map(i => i.str).join(' ').replace(/\s+/g,' ').trim();
+      } catch(e){ console.error('extract error', e); return ''; }
+    }
+
+    // Heuristic: find sku and qty in page text
+    function findSkuQtyPairs(pageText){
+      if(!pageText) return null;
+      // search for patterns with Qty
+      const pairs = [];
+      const reQty = /(?:Qty|QTY|qty)\\s*[:\\-]?\\s*([0-9]+)/ig;
+      let m;
+      while((m = reQty.exec(pageText)) !== null){
+        const qty = m[1];
+        // look backward to find SKU-like token (take up to 120 chars before)
+        const idx = m.index;
+        const start = Math.max(0, idx - 120);
+        const window = pageText.substring(start, Math.min(pageText.length, idx + 60));
+        // SKU typical patterns: tokens with '-' or parentheses like (MR)
+        const skuRe = /([A-Za-z0-9\\-]{3,}|[A-Za-z0-9\\-\\s]+\\(MR\\))/g;
+        const found = Array.from(window.matchAll(skuRe)).map(x=>x[0].trim());
+        const sku = found.length ? found[0] : null;
+        pairs.push({sku: sku || '[UNKNOWN SKU]', qty: qty, context: window.trim()});
+      }
+      // fallback: lines like "HC-77-P1-Multi (MR) | Qty - 2"
+      if(pairs.length === 0){
+        const alt = /([A-Za-z0-9\\-\\s\\(\\)\\/]{6,60})\\s+\\|?\\s*Qty\\s*[-:\\s]*([0-9]+)/ig;
+        while((m = alt.exec(pageText)) !== null){
+          pairs.push({sku: m[1].trim(), qty: m[2], context: m[0]});
+        }
+      }
+      return pairs.length ? pairs : null;
+    }
+
+    // Main processing
+    processBtn.addEventListener('click', async ()=>{
+      const files = filesInput.files;
+      if(!files || files.length === 0){ setStatus('Select one or more PDF files first.', true); return; }
+      processBtn.disabled = true; resetBtn.disabled = true; setStatus('Reading files...');
+      resultsEl.innerHTML = '';
+
+      try{
+        // load all PDFs with pdf.js for text extraction, and keep ArrayBuffers for pdf-lib
+        const buffers = await Promise.all(Array.from(files).map(f => f.arrayBuffer()));
+        setStatus('Parsing pages for text (this may take a few seconds)...');
+
+        // gather text by page across all files
+        const pageTexts = []; // {fileIndex, pageIndex, text}
+        for(let i=0;i<buffers.length;i++){
+          const loadingTask = pdfjsLib.getDocument({data: buffers[i]});
+          const pdf = await loadingTask.promise;
+          for(let p = 0; p < pdf.numPages; p++){
+            const txt = await extractPageText(pdf, p);
+            pageTexts.push({fileIndex: i, pageIndex: p, text: txt});
+            log(`Read file ${i+1} page ${p+1} - length ${txt.length}`);
+          }
+        }
+
+        // Merge full PDFs into pdf-lib doc
+        setStatus('Merging PDFs...');
+        const mergedPdf = await PDFLib.PDFDocument.create();
+        for(let i=0;i<buffers.length;i++){
+          const donor = await PDFLib.PDFDocument.load(buffers[i]);
+          const copied = await mergedPdf.copyPages(donor, donor.getPageIndices());
+          copied.forEach(pg => mergedPdf.addPage(pg));
+        }
+
+        // Determine invoice pages and extract SKU/Qty
+        setStatus('Detecting invoice pages and extracting SKU/Qty...');
+        // A simple rule: consider page with keywords as invoice
+        const invoiceKeyword = ['tax invoice','invoice','bill of supply','invoice date','order number','invoice no'];
+        const pageIsInvoice = pageTexts.map(pt => {
+          const t = (pt.text || '').toLowerCase();
+          return invoiceKeyword.some(k => t.includes(k));
+        });
+
+        // For each invoice page, extract pairs and mark its next page as its label to annotate
+        const annotations = []; // {labelGlobalIndex, textToPrint}
+        for(let i=0;i<pageTexts.length;i++){
+          if(pageIsInvoice[i]){
+            const pairs = findSkuQtyPairs(pageTexts[i].text);
+            if(pairs){
+              // map invoice page index to global page index in mergedPdf
+              const invoiceGlobalIndex = (() => {
+                // calculate global page number: sum pages of prior files + pageIndex
+                let pagesBefore = 0;
+                for(let f=0; f<pageTexts[i].fileIndex; f++){
+                  // find number of pages in that file by counting pageTexts entries
+                  pagesBefore += pageTexts.filter(pt=>pt.fileIndex===f).length;
+                }
+                return pagesBefore + pageTexts[i].pageIndex; // 0-based
+              })();
+
+              // find next page (assume next is label); if none, skip
+              const labelGlobalIndex = invoiceGlobalIndex + 1;
+              if(labelGlobalIndex < mergedPdf.getPageCount()){
+                // create combined text for all pairs on that invoice (concat)
+                const textLines = pairs.map(p=> `${p.sku} | Qty - ${p.qty}`);
+                const toPrint = textLines.join('  ||  '); // separate multiple items
+                annotations.push({labelGlobalIndex, toPrint});
+                log(`Invoice page ${invoiceGlobalIndex+1} -> label page ${labelGlobalIndex+1} : "${toPrint}"`);
+              } else {
+                log(`Invoice at global page ${invoiceGlobalIndex+1} has no following label page - skipped.`);
+              }
+            } else {
+              log(`No SKU/Qty found on invoice page ${i+1}.`);
+            }
+          }
+        }
+
+        if(annotations.length === 0){
+          setStatus('No invoice->label annotations found using heuristics.', true);
+        } else {
+          setStatus(`Annotating ${annotations.length} label page(s)...`);
+        }
+
+        // Create new PDF with labels only, adding text overlays
+        setStatus('Creating final PDF (labels only)...');
+        const outputPdf = await PDFLib.PDFDocument.create();
+        const srcPdfBytes = await mergedPdf.save();
+        const srcPdf = await PDFLib.PDFDocument.load(srcPdfBytes);
+
+        // Build set of pages to skip (invoice pages): invoices are all page indices where pageIsInvoice true
+        const invoiceGlobalIndices = new Set();
+        // compute global mapping of pageTexts order to global page index
+        // We'll iterate pageTexts and calculate global index for each entry
+        let globalCounter = 0;
+        for(let f=0; f<files.length; f++){
+          const pagesInFile = pageTexts.filter(pt=>pt.fileIndex===f).length;
+          for(let p=0; p<pagesInFile; p++){
+            const pt = pageTexts.find(x => x.fileIndex===f && x.pageIndex===p);
+            if(pt){
+              // find its order index in pageTexts (we already have them in array order)
+              const idx = pageTexts.indexOf(pt);
+              if(pageIsInvoice[idx]) invoiceGlobalIndices.add(globalCounter);
+            }
+            globalCounter++;
+          }
+        }
+
+        // For each page in source PDF: if not invoice, copy to output. If it's a label that needs annotation, we will overlay text.
+        const totalPages = srcPdf.getPageCount();
+        for(let i=0;i<totalPages;i++){
+          if(invoiceGlobalIndices.has(i)){
+            // skip invoice page
+            continue;
+          }
+          // copy page to output and annotate if needed
+          const [copied] = await outputPdf.copyPages(srcPdf, [i]);
+          outputPdf.addPage(copied);
+        }
+
+        // Now overlay text onto the correct label pages in outputPdf.
+        // We must map source labelGlobalIndex -> output page index (because outputPdf has invoice pages removed).
+        // Build array of all non-invoice global indices in order to map.
+        const nonInvoiceGlobals = [];
+        for(let i=0;i<totalPages;i++) if(!invoiceGlobalIndices.has(i)) nonInvoiceGlobals.push(i);
+
+        // embed font
+        const helv = await outputPdf.embedFont(PDFLib.StandardFonts.HelveticaBold);
+
+        annotations.forEach(ann => {
+          const srcLabelIndex = ann.labelGlobalIndex; // global index in srcPdf
+          const outIndex = nonInvoiceGlobals.indexOf(srcLabelIndex); // index in outputPdf pages
+          if(outIndex === -1){
+            console.warn('No mapping for label', srcLabelIndex);
+            return;
+          }
+          const page = outputPdf.getPage(outIndex);
+          const { width, height } = page.getSize();
+
+          // Decide placement: approximate position similar to example screenshot
+          // We'll place text near upper-middle area where item line is usually placed.
+          // Use offsets relative to page size for better adaptability.
+          const x = Math.max(40, width * 0.07); // left margin
+          const y = Math.max(160, height - 220); // a bit below top block (adjustable)
+          const fontSize = Math.round(Math.max(10, Math.min(14, width/60)));
+
+          page.drawText(ann.toPrint, {
+            x, y,
+            size: fontSize,
+            font: helv,
+            maxWidth: width - x - 40,
+            lineHeight: fontSize + 2
+          });
+
+          log(`Annotated output page ${outIndex+1} at approx (x:${x}, y:${y}) with: ${ann.toPrint}`);
+        });
+
+        // finalize
+        const finalBytes = await outputPdf.save();
+        const blob = new Blob([finalBytes], {type: 'application/pdf'});
+        const url = URL.createObjectURL(blob);
+
+        // show download link
+        resultsEl.innerHTML = '';
+        const dl = document.createElement('a');
+        dl.href = url;
+        dl.download = 'processed_labels.pdf';
+        dl.textContent = 'Download processed_labels.pdf (labels only, annotated)';
+        dl.className = 'download';
+        resultsEl.appendChild(dl);
+        downloadAllBtn.style.display = 'inline-block';
+        downloadAllBtn.onclick = () => window.open(url, '_blank');
+
+        setStatus('Done. Download available below.');
+      } catch(err){
+        console.error(err);
+        setStatus('Error: ' + (err.message || err), true);
+        resultsEl.innerHTML += '<pre>' + (err.stack || err) + '</pre>';
+      } finally {
+        processBtn.disabled = false; resetBtn.disabled = false;
+      }
+    });
+
+    resetBtn.addEventListener('click', ()=>{
+      filesInput.value = '';
+      resultsEl.innerHTML = '';
+      setStatus('idle');
+      downloadAllBtn.style.display = 'none';
+    });
+
+  </script>
+</body>
+</html>
